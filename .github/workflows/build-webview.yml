@@ -1,0 +1,229 @@
+name: Build WebView APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "اسم التطبيق"
+        required: true
+        default: "My App"
+        type: string
+
+      website_url:
+        description: "رابط الموقع الكامل HTTPS"
+        required: true
+        default: "https://example.com"
+        type: string
+
+      icon_url:
+        description: "رابط مباشر لصورة PNG أو JPG - اختياري"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Download Android project
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Change app name and website URL
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          WEBSITE_URL: ${{ inputs.website_url }}
+        run: |
+          python3 <<'PY'
+          import html
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          app_name = os.environ["APP_NAME"].strip()
+          website_url = os.environ["WEBSITE_URL"].strip()
+
+          if not app_name or len(app_name) > 50:
+              raise SystemExit("App name must be between 1 and 50 characters")
+
+          parsed = urlsplit(website_url)
+
+          if parsed.scheme != "https" or not parsed.netloc:
+              raise SystemExit("Website URL must be a valid HTTPS URL")
+
+          def java_escape(value: str) -> str:
+              return (
+                  value.replace("\\", "\\\\")
+                  .replace('"', '\\"')
+                  .replace("\r", "")
+                  .replace("\n", " ")
+              )
+
+          config_path = Path(
+              "app/src/main/java/com/monstertechno/webview/config/AppConfig.java"
+          )
+
+          config_text = config_path.read_text(encoding="utf-8")
+
+          config_text, url_changes = re.subn(
+              r'(public static final String TARGET_WEBSITE_URL\s*=\s*")[^"]*(";\s*)',
+              lambda match: (
+                  match.group(1)
+                  + java_escape(website_url)
+                  + match.group(2)
+              ),
+              config_text,
+              count=1,
+          )
+
+          config_text, name_changes = re.subn(
+              r'(public static final String APP_NAME\s*=\s*")[^"]*(";\s*)',
+              lambda match: (
+                  match.group(1)
+                  + java_escape(app_name)
+                  + match.group(2)
+              ),
+              config_text,
+              count=1,
+          )
+
+          if url_changes != 1:
+              raise SystemExit("Could not update website URL")
+
+          if name_changes != 1:
+              raise SystemExit("Could not update AppConfig app name")
+
+          config_path.write_text(config_text, encoding="utf-8")
+
+          strings_path = Path("app/src/main/res/values/strings.xml")
+          strings_text = strings_path.read_text(encoding="utf-8")
+
+          strings_text, string_changes = re.subn(
+              r'(<string\s+name="app_name">).*?(</string>)',
+              lambda match: (
+                  match.group(1)
+                  + html.escape(app_name, quote=False)
+                  + match.group(2)
+              ),
+              strings_text,
+              count=1,
+              flags=re.DOTALL,
+          )
+
+          if string_changes != 1:
+              raise SystemExit("Could not update Android app name")
+
+          strings_path.write_text(strings_text, encoding="utf-8")
+
+          print(f"Configured app: {app_name}")
+          print(f"Website: {website_url}")
+          PY
+
+      - name: Download and generate app icons
+        if: ${{ inputs.icon_url != '' }}
+        env:
+          ICON_URL: ${{ inputs.icon_url }}
+        run: |
+          case "$ICON_URL" in
+            https://*)
+              ;;
+            *)
+              echo "Icon URL must start with https://"
+              exit 1
+              ;;
+          esac
+
+          curl \
+            --fail \
+            --location \
+            --max-time 60 \
+            --proto '=https' \
+            "$ICON_URL" \
+            --output /tmp/icon-source
+
+          python3 -m venv /tmp/icon-venv
+          /tmp/icon-venv/bin/pip install --quiet pillow
+
+          /tmp/icon-venv/bin/python <<'PY'
+          from pathlib import Path
+          from PIL import Image, ImageOps
+
+          source = Image.open("/tmp/icon-source").convert("RGBA")
+
+          sizes = {
+              "mipmap-mdpi": 48,
+              "mipmap-hdpi": 72,
+              "mipmap-xhdpi": 96,
+              "mipmap-xxhdpi": 144,
+              "mipmap-xxxhdpi": 192,
+          }
+
+          resource_root = Path("app/src/main/res")
+
+          for folder_name, size in sizes.items():
+              folder = resource_root / folder_name
+              folder.mkdir(parents=True, exist_ok=True)
+
+              fitted = ImageOps.contain(
+                  source,
+                  (size, size),
+                  method=Image.Resampling.LANCZOS,
+              )
+
+              canvas = Image.new(
+                  "RGBA",
+                  (size, size),
+                  (0, 0, 0, 0),
+              )
+
+              position = (
+                  (size - fitted.width) // 2,
+                  (size - fitted.height) // 2,
+              )
+
+              canvas.alpha_composite(fitted, position)
+
+              for file_name in [
+                  "ic_launcher.webp",
+                  "ic_launcher_round.webp",
+              ]:
+                  canvas.save(
+                      folder / file_name,
+                      format="WEBP",
+                      lossless=True,
+                  )
+
+          for xml_file in resource_root.glob(
+              "mipmap-anydpi*/ic_launcher*.xml"
+          ):
+              xml_file.unlink()
+
+          print("Custom icons generated successfully")
+          PY
+
+      - name: Make Gradle executable
+        run: chmod +x ./gradlew
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Upload generated APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: webview-apk-${{ github.run_number }}
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
